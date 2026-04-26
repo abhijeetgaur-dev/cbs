@@ -1,4 +1,5 @@
-import { eq, and } from 'drizzle-orm';
+import { z } from 'zod';
+import { eq, and, ilike } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { contents } from '../db/schema/contents.js';
 import { contentSchedules } from '../db/schema/contentSchedules.js';
@@ -10,15 +11,18 @@ export const getLiveContent = async (req, res) => {
     const { teacherId } = req.params;
     const { subject } = req.query;
 
-    let baseConditions = [
+    if (!z.string().uuid().safeParse(teacherId).success) {
+      //incorrec teacher id entered
+      return res.status(200).json({ message: 'No content available' });
+    }
+
+    const conditions = [
       eq(contents.uploadedBy, teacherId),
       eq(contents.status, 'approved')
     ];
 
-    let filterConditions = [];
-
     if (subject) {
-      filterConditions.push(eq(contents.subject, subject));
+      conditions.push(ilike(contents.subject, subject));
     }
 
     const results = await db.select({
@@ -29,7 +33,7 @@ export const getLiveContent = async (req, res) => {
     .from(contents)
     .innerJoin(contentSchedules, eq(contents.id, contentSchedules.contentId))
     .innerJoin(contentSlots, eq(contentSchedules.slotId, contentSlots.id))
-    .where(and(... baseConditions, ...filterConditions));
+    .where(and(...conditions));
 
     if (results.length === 0) {
       return res.status(200).json({ message: "No content available" });
