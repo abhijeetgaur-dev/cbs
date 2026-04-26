@@ -1,7 +1,7 @@
 import { upload } from '../config/multer.js';
 import multer from 'multer';
 
-const uploadMiddleware = (req, res, next) => {
+export const uploadMiddleware = (req, res, next) => {
   upload.single('file')(req, res, (err) => {
     if (err instanceof multer.MulterError) {
       // Catch Multer-specific errors (e.g. file too large)
