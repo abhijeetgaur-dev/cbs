@@ -1,0 +1,22 @@
+# Architecture Notes
+
+## Architecture Overview
+The system employs a strict Controller-Service-Repository architecture
+- **Controllers** handle extraction of data from Express `req` variables, passing them down, and formatting `res` responses correctly including HTTP statuses.
+- **Services** encompass the hardcore business logic (e.g. JWT processing mapped with hashing, conditional filters during content rotation assignments, and querying exact slots).
+- **Validators** act as the first line of defense. By pushing `Zod` validation directly into the middleware pipeline, we guarantee that Services only ever handle predictable data shapes.
+
+## S3 & Multer
+Rather than cluttering the local file system with up to 10MB individual files, `multer-s3` pushes buffers directly into an AWS S3 bucket. Our metadata preserves the S3 location mapping inside the Drizzle table under `contents.filePath`. 
+
+## Scheduling Logic (Resolver constraints)
+The function `getActiveContent()` strictly enforces logic as a Pure Function taking the array of approved contents mapping their schedule times. 
+By resolving: 
+1. The difference in start/end boundary conditions against `nowMs`.
+2. Calculating modulo logic over the total duration offsets.
+3. Looping linearly through the current rotation...
+It allows perfectly stateless rotation logic on any query to `/content/live/:teacherId`, keeping the cache invalidations completely separate from memory leaks or race conditions.
+
+## Authentication and RBAC
+The system exposes explicit RBAC (`req.user.role`). We use two roles: `principal` and `teacher`.
+`requireRole(required)` binds the routes transparently preventing authorization bleeding.
