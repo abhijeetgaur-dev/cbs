@@ -1,22 +1,406 @@
-# Architecture Notes
+CONTENT BROADCASTING SYSTEM — ARCHITECTURE NOTES
+=================================================
 
-## Architecture Overview
-The system employs a strict Controller-Service-Repository architecture
-- **Controllers** handle extraction of data from Express `req` variables, passing them down, and formatting `res` responses correctly including HTTP statuses.
-- **Services** encompass the hardcore business logic (e.g. JWT processing mapped with hashing, conditional filters during content rotation assignments, and querying exact slots).
-- **Validators** act as the first line of defense. By pushing `Zod` validation directly into the middleware pipeline, we guarantee that Services only ever handle predictable data shapes.
 
-## S3 & Multer
-Rather than cluttering the local file system with up to 10MB individual files, `multer-s3` pushes buffers directly into an AWS S3 bucket. Our metadata preserves the S3 location mapping inside the Drizzle table under `contents.filePath`. 
+─────────────────────────────────────────────────
+1. AUTHENTICATION & RBAC FLOW
+─────────────────────────────────────────────────
 
-## Scheduling Logic (Resolver constraints)
-The function `getActiveContent()` strictly enforces logic as a Pure Function taking the array of approved contents mapping their schedule times. 
-By resolving: 
-1. The difference in start/end boundary conditions against `nowMs`.
-2. Calculating modulo logic over the total duration offsets.
-3. Looping linearly through the current rotation...
-It allows perfectly stateless rotation logic on any query to `/content/live/:teacherId`, keeping the cache invalidations completely separate from memory leaks or race conditions.
+Authentication is implemented using JWT (JSON Web Tokens) with bcrypt password hashing.
 
-## Authentication and RBAC
-The system exposes explicit RBAC (`req.user.role`). We use two roles: `principal` and `teacher`.
-`requireRole(required)` binds the routes transparently preventing authorization bleeding.
+REGISTRATION & LOGIN:
+  - User registers with name, email, password, and role (principal or teacher)
+  - Password is hashed using bcrypt with saltRounds: 10 before storing
+  - On login, bcrypt compares the submitted password against the stored hash
+  - On success, a JWT is signed with payload { id, role } and 24h expiry
+  - The token is returned to the client and must be sent on every protected request
+
+JWT VERIFICATION (auth.middleware.js):
+  - Extracts Bearer token from the Authorization header
+  - Verifies and decodes the token using the JWT secret
+  - Attaches req.user = { id, role } to the request object
+  - Returns 401 if the token is missing, malformed, or expired
+
+ROLE-BASED ACCESS CONTROL (role.middleware.js):
+  - A factory function requireRole('principal') or requireRole('teacher')
+  - Reads req.user.role set by the auth middleware
+  - Returns 403 Forbidden if the role does not match the required role
+  - Permissions are strictly separated:
+
+    Principal → view all content, approve content, reject content (with reason)
+    Teacher   → upload content, view own content status
+    Student   → no authentication, hits only the public broadcast endpoint
+
+MIDDLEWARE CHAIN ON PROTECTED ROUTES:
+  Request → authMiddleware → requireRole() → validate() → controller
+
+  Each layer has a single responsibility. If any layer fails, the request
+  is rejected immediately and the next layers are never reached.
+
+
+─────────────────────────────────────────────────
+2. SUBJECT-BASED SYSTEM DESIGN
+─────────────────────────────────────────────────
+
+A subject is NOT a property of a teacher. It is a property of each individual
+content item. A single teacher can upload content for multiple subjects.
+
+  Teacher 1 uploads:
+    → Content A  (subject: maths)
+    → Content B  (subject: maths)
+    → Content C  (subject: science)
+
+This means no teacher-subject assignment table is needed. The subject field
+lives on the contents table, making the model simpler and more flexible.
+
+CONTENT SLOTS act as rotation groups. One slot is created per (teacher, subject)
+pair at the point of approval. All content belonging to the same teacher and
+subject shares a slot, which drives the independent rotation per subject.
+
+This means:
+  - Teacher 1's Maths content rotates on its own cycle
+  - Teacher 1's Science content rotates on its own independent cycle
+  - Teacher 2's Maths content is completely separate from Teacher 1's
+
+On the public broadcast endpoint, when no subject filter is provided, results
+are grouped by subject in application code and one active item is returned
+per subject independently. When a subject filter is provided, only that
+subject's rotation pool is evaluated.
+
+
+─────────────────────────────────────────────────
+3. UPLOAD HANDLING APPROACH
+─────────────────────────────────────────────────
+
+File uploads are handled using Multer with two supported storage strategies:
+
+  Local Storage  → files stored in the /uploads directory on the server
+  S3 Storage     → files stored in AWS S3 (bonus implementation)
+
+VALIDATION HAPPENS IN TWO LAYERS:
+
+  Layer 1 — Multer (file validation):
+    - Allowed MIME types: image/jpeg, image/png, image/gif
+    - Maximum file size: 10MB
+    - File type is checked in the fileFilter callback
+    - If rejected, Multer throws an error before the controller runs
+
+  Layer 2 — Zod (body field validation):
+    - title: required string
+    - subject: required string
+    - description: optional string
+    - start_time: optional ISO datetime
+    - end_time: optional ISO datetime (must be after start_time, enforced via refine)
+    - duration: optional integer in minutes (defaults to 5 on approval)
+
+IMPORTANT — MULTER ERROR HANDLING:
+  Multer errors do not reach the controller's try/catch block automatically.
+  To return JSON error responses instead of Express's default HTML error page,
+  Multer is run inside a custom uploadMiddleware (upload.middleware.js) that
+  wraps upload.single() in a callback and intercepts multer.MulterError and
+  custom fileFilter errors. It also verifies that req.file exists, rejecting
+  requests where no file was submitted.
+
+FILE NAMING:
+  Files are stored with a unique name: `contents/{timestamp}-{random}.{ext}`
+  This prevents filename collisions even under concurrent uploads.
+
+FILE URL IN RESPONSE:
+  For local storage: URL is constructed as `{protocol}://{host}/uploads/{filename}`
+  For S3 storage: multer-s3 provides req.file.location as a full S3 URL directly
+  Raw file system paths are never exposed to clients.
+
+
+─────────────────────────────────────────────────
+4. APPROVAL WORKFLOW DESIGN
+─────────────────────────────────────────────────
+
+Content follows a strict linear lifecycle:
+
+  uploaded → pending → approved
+                    → rejected (reason required)
+
+STATE TRANSITIONS:
+  - Content is created with status = 'pending'
+  - Only a principal can change the status
+  - A pending content can be approved or rejected
+  - Once approved or rejected, status cannot be changed again
+  - Attempting to approve already-approved content returns a 400 error
+
+APPROVAL FLOW:
+  1. Principal calls PATCH /approval/:contentId/approve
+  2. System verifies content exists and is in 'pending' status
+  3. Content is updated: status = approved, approved_by, approved_at = NOW()
+  4. System finds or creates a ContentSlot for (teacher_id, subject) pair
+  5. System queries MAX(rotation_order) for that slot
+  6. A ContentSchedule entry is created with rotation_order = max + 1
+  7. Duration is taken from the content record (default: 5 minutes)
+
+REJECTION FLOW:
+  1. Principal calls PATCH /approval/:contentId/reject
+  2. Request body must include rejection_reason (Zod enforces this)
+  3. Content is updated: status = rejected, rejection_reason stored
+  4. No slot or schedule entry is created for rejected content
+
+ROTATION ORDER ASSIGNMENT:
+  Rotation order is assigned at approval time, not upload time. This ensures
+  that only approved content ever enters the scheduling pool. New content
+  approved mid-broadcast is automatically appended to the end of the rotation
+  and picked up on the very next broadcast request with no manual intervention.
+
+
+─────────────────────────────────────────────────
+5. SCHEDULING / ROTATION LOGIC (CORE ENGINE)
+─────────────────────────────────────────────────
+
+The scheduling engine is a pure stateless function. It has no database calls,
+no cron jobs, no background workers, and no stored pointers. Every request
+recalculates the active content from scratch using the current time.
+
+This means:
+  - No state needs to be maintained between requests
+  - New approved content is picked up automatically on the next request
+  - The system is horizontally scalable with no coordination required
+  - The function can be tested in complete isolation
+
+FUNCTION SIGNATURE:
+  getActiveContent(contentsWithSchedules, nowMs) → content | null
+
+ALGORITHM STEP BY STEP:
+
+  Step 1 — Guard clause
+    If the input list is empty or null, return null immediately.
+
+  Step 2 — Filter by time window
+    Keep only content where start_time <= nowMs <= end_time.
+    Both start_time and end_time are converted to milliseconds via getTime()
+    before comparison to avoid type ambiguity (Drizzle may return Date objects
+    or ISO strings depending on driver config).
+    If start_time or end_time is null, that boundary is treated as open.
+
+  Step 3 — Empty after filter
+    If no content passes the time window check, return null.
+    This covers the case where content is approved but its schedule window
+    has not started yet or has already expired.
+
+  Step 4 — Single item short-circuit
+    If only one item is in the active pool, return it immediately.
+    No rotation math needed.
+
+  Step 5 — Sort by rotation_order ascending
+    Ensures the rotation sequence is consistent and deterministic.
+
+  Step 6 — Calculate total cycle duration
+    totalCycle = sum of all duration values (in minutes) across active items.
+    This is the length of one full rotation loop.
+
+  Step 7 — Calculate elapsed time from midnight
+    midnight = today at 00:00:00.000 local time
+    elapsedMinutes = Math.floor((nowMs - midnight) / 60000)
+    Midnight is chosen as the reference point because:
+      a) School content is daily — a fresh rotation every morning makes sense
+      b) It is simple and universally calculable
+      c) It makes the schedule predictable for teachers
+
+  Step 8 — Find position in current cycle
+    position = elapsedMinutes % totalCycle
+    This wraps elapsed time back into the range [0, totalCycle) continuously.
+
+  Step 9 — Walk the list to find active slot
+    cursor = 0
+    For each content item in rotation order:
+      cursor += item.duration
+      if position < cursor → this item is currently active, return it
+
+  Step 10 — Safe fallback
+    If the walk exhausts without a match (floating point edge case where
+    position equals totalCycle exactly), return the last item in the list.
+    Returning null here would be incorrect.
+
+CONCRETE EXAMPLE:
+  Contents: [A: 5min, B: 5min, C: 3min]
+  Total cycle: 13 minutes
+  Current time: 9:14 AM
+  Elapsed since midnight: 554 minutes
+  Position: 554 % 13 = 8
+
+  Walk:
+    A → cursor = 5.  Is 8 < 5?  No.
+    B → cursor = 10. Is 8 < 10? Yes. → Return B
+
+SUBJECT INDEPENDENCE:
+  The function receives a pre-filtered list for one subject only.
+  The caller (broadcast controller) is responsible for grouping results
+  by subject and calling getActiveContent once per subject group.
+  This ensures each subject has its own independent rotation pool.
+
+NEW CONTENT APPROVED MID-BROADCAST:
+  Since the engine recalculates on every request, newly approved content
+  is picked up immediately on the next request. It is appended to the
+  end of the rotation (highest rotation_order). The total cycle length
+  increases, causing a one-time positional shift in the rotation, which
+  corrects itself on the next full loop. This is acceptable behavior.
+
+
+─────────────────────────────────────────────────
+6. DATABASE DESIGN DECISIONS
+─────────────────────────────────────────────────
+
+Four tables. Each has a clear single responsibility.
+
+TABLE: users
+  Stores all authenticated users regardless of role.
+  Role is an enum (principal, teacher) stored on the user record.
+  A single table for both roles avoids join complexity and keeps
+  authentication logic simple. Permissions are enforced in middleware,
+  not in the DB schema.
+
+TABLE: contents
+  Central table. Stores all uploaded content with its full lifecycle state.
+  status enum (pending, approved, rejected) drives the workflow.
+  start_time and end_time are set by the teacher at upload time and control
+  the scheduling window. These fields are nullable — content without a window
+  is never shown on the broadcast endpoint.
+  approved_by and approved_at are nullable, populated only on approval.
+  rejection_reason is nullable, populated only on rejection.
+
+TABLE: content_slots
+  One record per (teacher_id, subject) pair.
+  Acts as a named rotation group. All content for the same teacher and
+  subject shares a slot. Created lazily on first approval for that pair.
+  This table exists to give the scheduling system a stable group identifier
+  without embedding grouping logic in the contents table itself.
+
+TABLE: content_schedules
+  One record per approved content item.
+  Stores rotation_order and duration for scheduling purposes.
+  rotation_order is assigned sequentially at approval time (MAX + 1).
+  duration defaults to 5 minutes if not specified by the teacher.
+  This separation keeps scheduling metadata out of the contents table,
+  making it easy to modify scheduling behavior without touching content records.
+
+ALL IDs ARE UUIDs:
+  UUIDs are used as primary keys rather than auto-incrementing integers.
+  This prevents ID enumeration attacks on the public broadcast endpoint
+  where teacherId is a URL parameter.
+
+
+─────────────────────────────────────────────────
+7. FOLDER STRUCTURE
+─────────────────────────────────────────────────
+
+src/
+├── db/
+│   ├── index.js               Drizzle client and pg pool connection
+│   └── schema/                One file per table — source of truth for DB schema
+│       ├── users.js
+│       ├── contents.js
+│       ├── contentSlots.js
+│       └── contentSchedules.js
+│
+├── config/
+│   └── multer.js              Storage engine, file filter, size limits
+│
+├── middlewares/
+│   ├── auth.middleware.js      JWT verification, attaches req.user
+│   ├── role.middleware.js      RBAC enforcement, factory function
+│   ├── validate.middleware.js  Zod schema validation wrapper
+│   ├── upload.middleware.js    Wraps multer to return JSON errors
+│   └── rateLimit.middleware.js Rate limiter for public broadcast route
+│
+├── validators/                Zod schemas isolated per module
+│   ├── auth.validators.js
+│   ├── content.validators.js
+│   └── approval.validators.js
+│
+├── controllers/               Thin layer — HTTP in, HTTP out, no business logic
+│   ├── auth.controller.js
+│   ├── content.controller.js
+│   ├── approval.controller.js
+│   └── broadcast.controller.js
+│
+├── services/                  All business logic lives here
+│   ├── auth.service.js
+│   ├── content.service.js
+│   ├── approval.service.js
+│   └── scheduling.service.js  Pure scheduling function, no dependencies
+│
+├── routes/                    Wire middlewares and controllers to paths
+│   ├── auth.routes.js
+│   ├── content.routes.js
+│   ├── approval.routes.js
+│   └── broadcast.routes.js
+│
+└── app.js                     Express setup, route mounting, static files
+
+drizzle.config.js              Drizzle Kit config (lives at project root)
+
+DESIGN PRINCIPLE — CONTROLLERS ARE THIN, SERVICES ARE FAT:
+  Controllers only handle HTTP concerns: extracting params, calling a service,
+  returning a response. All business logic, DB queries, and decisions live
+  in services. This makes services independently testable without HTTP context.
+
+
+─────────────────────────────────────────────────
+8. MIDDLEWARE USAGE
+─────────────────────────────────────────────────
+
+Middlewares are composable and applied in a deliberate order:
+
+PROTECTED ROUTE CHAIN:
+  authMiddleware       → Is the JWT valid? Who is this user?
+  requireRole(role)    → Does this user have permission for this action?
+  uploadMiddleware     → (upload routes only) Is the file valid?
+  validate(schema)     → Is the request body valid?
+  controller           → Execute the business logic
+
+Each middleware has one job and fails fast with a clear error if its
+check does not pass. The controller only runs if every preceding layer
+passed successfully.
+
+PUBLIC ROUTE CHAIN (broadcast routes):
+  liveBroadcastLimiter → Rate limiting: 60 requests/min per IP
+  controller           → Runs with UUID validation inside
+  No auth or role middleware is applied.
+
+MULTER ERROR INTERCEPTION:
+  Multer is wrapped in uploadMiddleware rather than used directly in routes.
+  This is because Multer calls next(err) on failure, which bypasses
+  the controller's try/catch and hits Express's default error handler,
+  which returns HTML. The wrapper intercepts this and returns JSON.
+
+ZOD VALIDATION MIDDLEWARE:
+  A single reusable validate(schema) factory is used across all routes.
+  On failure it returns 400 with flattened field-level errors.
+  On success it replaces req.body with the clean parsed output from Zod,
+  stripping any extra fields the client may have sent.
+
+
+─────────────────────────────────────────────────
+9. SCALABILITY APPROACH
+─────────────────────────────────────────────────
+
+CURRENT DESIGN — STATELESS AND HORIZONTALLY SCALABLE:
+  The scheduling engine is a pure function with no shared state.
+  Multiple server instances can run simultaneously with no coordination.
+  Each request is fully self-contained.
+
+RATE LIMITING (express-rate-limit — implemented):
+  The public broadcast endpoint has no authentication.
+  Rate limiting is applied via liveBroadcastLimiter middleware
+  (middlewares/rateLimit.middleware.js) on all /content/live/* routes.
+  Configuration: 60 requests per minute per IP, returns JSON error
+  on breach, uses standard RateLimit-* headers.
+
+DATABASE INDEXING:
+  The following indexes are recommended for query performance:
+    - contents(uploaded_by, status)     used on every broadcast query
+    - contents(subject)                 used for subject filtering
+    - content_schedules(slot_id)        used for rotation order lookups
+    - content_slots(teacher_id, subject) used for slot lookup on approval
+
+S3 FOR FILE STORAGE:
+  Local disk storage does not scale across multiple server instances.
+  S3 is implemented as the bonus storage backend. All instances share
+  the same S3 bucket, making file access consistent regardless of
+  which server handled the upload.
