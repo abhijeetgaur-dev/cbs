@@ -32,9 +32,8 @@ app.use((err, req, res, next) => {
 
 export default app;
 
-if (process.argv[1] && process.argv[1].endsWith('app.js')) {
-    const port = process.env.PORT || 3000;
-    app.listen(port, () => {
-        console.log(`Server listening on port ${port}`);
-    });
-}
+const port = process.env.PORT || 3000;
+
+app.listen(port, () => {
+    console.log(`Server listening on port ${port}`);
+});
