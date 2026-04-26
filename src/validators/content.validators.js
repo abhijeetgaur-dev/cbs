@@ -1,11 +1,11 @@
-import { z } from 'zod';
+import { z} from 'zod';
 
 export const uploadSchema = z.object({
   title: z.string().min(1, 'Title is required'),
   subject: z.string().min(1, 'Subject is required'),
   description: z.string().optional(),
-  start_time: z.iso().datetime().optional(),
-  end_time: z.iso().datetime().optional(),
+  start_time: z.string().datetime().optional(),
+  end_time: z.string().datetime().optional(),
   duration: z.coerce.number().int().min(1).optional() 
 }).refine(
   (data) => {
